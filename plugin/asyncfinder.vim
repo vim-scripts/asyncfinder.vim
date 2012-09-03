@@ -1,9 +1,9 @@
 " asyncfinder.vim - simple asynchronous fuzzy file finder for vim
 " Maintainer: Dmitry "troydm" Geurkov <d.geurkov@gmail.com>
-" Version: 0.1
+" Version: 0.2.5
 " Description: asyncfinder.vim is a simple asychronous fuzzy file finder
 " that searches for files in background without making you frustuated 
-" Last Change: 30 August, 2012
+" Last Change: 3 September, 2012
 " License: Vim License (see :help license)
 " Website: https://github.com/troydm/asyncfinder.vim
 "
@@ -23,12 +23,20 @@ if !exists("g:asyncfinder_ignore_files")
     let g:asyncfinder_ignore_files = "['*.swp']"
 endif
 
+if !exists("g:asyncfinder_initial_mode")
+    let g:asyncfinder_initial_mode = "a"
+endif
+
 if !exists("g:asyncfinder_initial_pattern")
     let g:asyncfinder_initial_pattern = "*"
 endif
 
 if !exists("g:asyncfinder_include_buffers")
     let g:asyncfinder_include_buffers = 1
+endif
+
+if !exists("g:asyncfinder_include_mru_files")
+    let g:asyncfinder_include_mru_files = 1
 endif
 
 if !exists("g:asyncfinder_edit_file_on_single_result")
@@ -40,6 +48,8 @@ python << EOF
 import vim, os, threading, fnmatch, random
 
 async_pattern = None
+async_prev_pattern = None
+async_prev_mode = None
 async_output = None
 
 class AsyncOutput:
@@ -84,22 +94,34 @@ class AsyncGlobber:
         self.ignore_dirs = []
         self.ignore_files = []
         self.buffers = []
+        self.files = []
+        self.cwd = os.getcwd()+os.path.sep
 
     def addDir(self,p):
         if p.startswith(self.dir+os.path.sep):
             p = p[len(self.dir+os.path.sep):] 
         if not p in self.buffers:
             self.output.append("d "+p)
+            self.files.append(p)
 
     def addFile(self,p):
         if p.startswith(self.dir+os.path.sep):
             p = p[len(self.dir+os.path.sep):] 
         if not p in self.buffers:
             self.output.append("f "+p)
+            self.files.append(p)
 
     def addBuffer(self,p):
+        if p.startswith(self.cwd): 
+            p = p[len(self.cwd):]
         self.output.append("b "+p)
         self.buffers.append(p)
+
+    def addMruFile(self,p):
+        if p.startswith(self.cwd): 
+            p = p[len(self.cwd):]
+        if (not p in self.buffers) and (not p in self.files):
+            self.output.append("m "+p)
 
     def fnmatch(self,f,p):
         if self.case_sensitive:
@@ -123,6 +145,17 @@ class AsyncGlobber:
         for buf in buffers:
             if buf != None and self.fnmatch(buf,pattern):
                 self.addBuffer(buf)
+
+    def glob_mru_files(self,mru_list,pattern):
+        if mru_list == None:
+            return
+        pattern = '*'.join(pattern.split('**'))
+        for mru in mru_list:
+            if mru != None:
+                mru = mru.strip() 
+                if self.fnmatch(mru,pattern):
+                    if not self.fnmatch_list(mru,self.ignore_files):
+                        self.addMruFile(mru)
 
     def glob(self,dir,pattern):
         self.dir = dir
@@ -148,6 +181,8 @@ class AsyncGlobber:
                     rec_index = pi
         pre = pattern[:mag_index]
         post = pattern[mag_index:]
+        if len(pre) > 0 and pre[0] == '':
+            pre.insert(0,'')
         pre = os.path.sep.join(pre)
         if len(pre) > 0:
             if dir != '.':
@@ -155,9 +190,13 @@ class AsyncGlobber:
         else:
             pre = dir
         post = os.path.sep.join(post)
-        self.walk(pre,pre+os.path.sep+post,rec_index != None)
+        post = pre+os.path.sep+post
+        # normalize path removing double //
+        pre = pre.replace(os.path.sep+os.path.sep,os.path.sep)
+        post = post.replace(os.path.sep+os.path.sep,os.path.sep)
+        self.walk(pre,post,rec_index != None)
 
-    def walk(self,dir,pattern, recurse=True):
+    def walk(self,dir, pattern, recurse=True):
         for root, dirs, files in os.walk(dir):
             if self.output.toExit():
                 break
@@ -180,10 +219,10 @@ def AsyncRefreshN():
 
 def AsyncRefreshI():
     AsyncRefresh()
-    vim.command("call feedkeys(\"\<C-o>f\<ESC>\")")
+    vim.command("call <SID>MoveCursorI()")
 
 def AsyncRefresh():
-    global async_pattern, async_output
+    global async_pattern, async_prev_pattern, async_prev_mode, async_output
     if len(vim.current.buffer) == 1:
         vim.command("bd!")
         return
@@ -194,8 +233,11 @@ def AsyncRefresh():
         return
     elif cl < 3:
         vim.current.buffer[1] = '>  '
+    mode = vim.eval("getbufvar('%','asyncfinder_mode')")
     pattern = vim.current.buffer[1]
     pattern = pattern[2:].strip()
+    async_prev_pattern = pattern
+    async_prev_mode = mode
     # expand tilde ~ to user home directory
     if '~' in pattern:
         pattern = pattern.replace('~',os.path.expanduser('~'))
@@ -211,11 +253,14 @@ def AsyncRefresh():
             async_pattern = pattern
             ignore_dirs = vim.eval("g:asyncfinder_ignore_dirs")
             ignore_files = vim.eval("g:asyncfinder_ignore_files")
-            if vim.eval("g:asyncfinder_include_buffers") == "1":
+            if ('a' in mode or 'b' in mode) and vim.eval("g:asyncfinder_include_buffers") == "1":
                 buf_list = vim.eval("map(filter(range(1,bufnr(\"$\")), \"buflisted(v:val)\"),\"bufname(v:val)\")")
             else:
                 buf_list = []
-            t = threading.Thread(target=AsyncSearch, args=(pattern,buf_list,ignore_dirs,ignore_files,))
+            mru_file = ""
+            if ('a' in mode or 'm' in mode) and vim.eval("g:asyncfinder_include_mru_files") == "1" and vim.eval("exists('MRU_File')") == "1":
+                mru_file = vim.eval("MRU_File")
+            t = threading.Thread(target=AsyncSearch, args=(mode,pattern,buf_list,mru_file,ignore_dirs,ignore_files,))
             t.daemon = True
             t.start()
     else:
@@ -227,27 +272,47 @@ def AsyncRefresh():
             async_output = None
     running = async_output != None and not async_output.toExit()
     if running:
-        vim.current.buffer[0] = 'Searching for files'+('.'*random.randint(1,3))
+        dots = '.'*random.randint(1,3)
+        dots = dots+' '*(3-len(dots))
+        vim.current.buffer[0] = 'Searching files'+dots+' (mode: '+mode+' cwd: '+os.getcwd()+')'
     else:
-        vim.current.buffer[0] = 'Type your pattern' 
+        vim.current.buffer[0] = 'Type your pattern  (mode: '+mode+' cwd: '+os.getcwd()+')' 
     if async_output != None:
         output = async_output.get()
         if len(output) > 0:
             vim.current.buffer.append(output)
 
-def AsyncSearch(pattern,buf_list,ignore_dirs,ignore_files):
+def AsyncSearch(mode,pattern,buf_list, mru_file,ignore_dirs,ignore_files):
     global async_output
     output = async_output
+    if output.toExit():
+        return
     glob = AsyncGlobber(output)
     glob.ignore_dirs = eval(ignore_dirs)
     glob.ignore_files = eval(ignore_files)
-    if not glob.has_magic(pattern):
-        if not ('.' in pattern or '/' in pattern):
-            pattern = '*'+pattern
-    if pattern[-1] != '*':
-        pattern = pattern+'*'
-    glob.glob_buffers(buf_list,pattern)
-    glob.glob('.',pattern)
+    pattern = pattern.split(os.path.sep)
+    if not glob.has_magic(pattern[-1]):
+        if len(pattern[-1]) > 0:
+            pattern[-1] = '*'+pattern[-1]+'*'
+        else:
+            pattern[-1] = '*'
+    pattern = os.path.sep.join(pattern)
+    if 'a' in mode or 'b' in mode:
+        glob.glob_buffers(buf_list,pattern)
+    if output.toExit():
+        return
+    if 'a' in mode or 'f' in mode:
+        glob.glob('.',pattern)
+    if ('a' in mode or 'm' in mode) and len(mru_file) > 0:
+            try:
+                m = open(mru_file)
+                mru_list = m.readlines()[1:]
+                m.close()
+                if output.toExit():
+                    return
+                glob.glob_mru_files(mru_list,pattern)
+            except IOError:
+                pass
     output.exit()
 
 def AsyncCancel():
@@ -258,10 +323,21 @@ def AsyncCancel():
         async_output = None
 
 EOF
+
+function! s:MoveCursorI()
+    if col('.') == 1
+        call feedkeys("\<Right>\<Left>",'n')
+    else
+        call feedkeys("\<Left>\<Right>",'n')
+    endif
+endfunction
 function! s:Clear()
     if line('$') > 2
         3,$delete
     endif
+endfunction
+function! s:ClearPrompt()
+    call setline(2,'>  ')
 endfunction
 function! s:Edit()
     let f = ''
@@ -281,7 +357,7 @@ function! s:Edit()
             call feedkeys("ggjA")
             call s:Clear()
         endif
-        if (f[0] == 'f' || f[0] == 'b') && f[1] == ' ' 
+        if (f[0] == 'f' || f[0] == 'b' || f[0] == 'm') && f[1] == ' ' 
             silent! bd!
             exe ':e '.f[2:]
         endif
@@ -308,7 +384,7 @@ function! s:EnterPressed()
                 call s:Clear()
                 return
             endif
-            if g:asyncfinder_edit_file_on_single_result && (t[0] == 'f' || t[0] == 'b')
+            if g:asyncfinder_edit_file_on_single_result && (t[0] == 'f' || t[0] == 'b' || t[0] == 'm')
                 if line('$') == 3
                     call s:Edit()
                     return
@@ -351,18 +427,53 @@ function! s:CharTyped()
 endfunction
 function! s:PositionCursor()
     let p = getpos('.')
-    if p[1] == 1 || p[2] < 3
+    if p[1] == 1 || (p[1] == 2 && p[2] < 3)
         normal ggjA
     endif
 endfunction
-function! s:OpenWindow()
+function! s:ChangeMode()
+    let mode = getbufvar('%','asyncfinder_mode')
+    let moder = '1s/mode: '.mode.' /mode: '
+    if mode == 'a'
+        if g:asyncfinder_include_buffers
+            let mode = 'b'
+        else
+            let mode = 'f'
+        endif
+    elseif mode == 'b'
+        let mode = 'f'
+    elseif mode == 'f'
+        if g:asyncfinder_include_mru_files
+            let mode = 'm'
+        else
+            let mode = 'a'
+        endif
+    else
+        let mode = 'a'
+    endif
+    call setbufvar('%','asyncfinder_mode',mode)
+    let moder .= mode.' '
+    exe moder
+    python async_pattern = None
+endfunction
+function! s:ChangeModeTo(mode)
+    if a:mode == 'a' || a:mode == 'b' || a:mode == 'f' || a:mode =='m' 
+        let mode = getbufvar('%','asyncfinder_mode')
+        let moder = '1s/mode: '.mode.' /mode: '
+        call setbufvar('%','asyncfinder_mode',a:mode)
+        let moder .= a:mode.' '
+        exe moder
+    endif
+endfunction
+function! s:OpenWindow(bang,pattern)
     let winnr = bufwinnr('^asyncfinder$')
     if winnr < 0
         execute &lines/3 . 'sp asyncfinder'
         setlocal filetype=asyncfinder buftype=nofile bufhidden=wipe nobuflisted noswapfile nowrap
         call setbufvar("%","prevupdatetime",&updatetime)
-        call setline(1, 'Type your pattern')
-        call append(1, '>  ')
+        call setbufvar("%","asyncfinder_mode",g:asyncfinder_initial_mode)
+        call setline(1, 'Type your pattern  (mode: '.g:asyncfinder_initial_mode.' cwd: '.getcwd().')')
+        call s:ClearPrompt()
         set updatetime=500
         au BufEnter <buffer> set updatetime=500
         au BufWipeout <buffer> python AsyncCancel()
@@ -377,16 +488,52 @@ function! s:OpenWindow()
         nnoremap <buffer> <CR> :call <SID>EnterPressed()<CR>
         nnoremap <buffer> <Del> :call <SID>DelPressed()<CR>
         inoremap <buffer> <C-q> <ESC>:silent! bd! \| echo<CR>
+        inoremap <buffer> <C-f> <C-o>:call <SID>ChangeMode()<CR>
+        nnoremap <buffer> <C-f> :call <SID>ChangeMode()<CR>
         startinsert
-        if !empty(g:asyncfinder_initial_pattern)
+        let pattern = a:pattern
+        if a:bang == '!'
+            let pattern = pyeval('async_prev_pattern')
+            let mode = pyeval('async_prev_mode')
+            if mode != g:asyncfinder_initial_mode
+                let pattern = '-mode='.mode.' '.pattern
+            endif
+        endif
+        let m = matchlist(pattern,'-mode=\?\([abfm]\)\?')
+        if !empty(m)
+            call s:ChangeModeTo(m[1])
+            let pattern = substitute(pattern, '\s*-mode=\?[abfm]\?\s*','','')
+        endif
+        if !empty(pattern)
+            call feedkeys(pattern)
+            python AsyncRefreshI()
+        elseif !empty(g:asyncfinder_initial_pattern)
             call feedkeys(g:asyncfinder_initial_pattern)
             python AsyncRefreshI()
         endif
     else
         exe winnr . 'wincmd w'
+        call s:ClearPrompt()
         normal gg
         startinsert
+        let pattern = a:pattern
+        let m = matchlist(pattern,'-mode=\?\([abfm]\)\?')
+        if !empty(m)
+            call s:ChangeModeTo(m[1])
+            let pattern = substitute(pattern, '\s*-mode=\?[abfm]\?\s*','','')
+        endif
+        if a:bang == '!'
+            let pattern = pyeval('async_prev_pattern')
+        endif
+        if !empty(pattern)
+            call feedkeys(pattern)
+            python AsyncRefreshI()
+        else
+            let pattern = pyeval('async_prev_pattern')
+            call feedkeys(pattern)
+            python AsyncRefreshI()
+        endif
     endif
 endfunction
 
-command! AsyncFinder call s:OpenWindow() 
+command! -bang -nargs=* -complete=file AsyncFinder call s:OpenWindow('<bang>',<q-args>) 
